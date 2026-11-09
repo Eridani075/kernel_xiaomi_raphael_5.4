@@ -1183,6 +1183,153 @@ int smb5_set_prop_comp_clamp_level(struct smb_charger *chg,
 /************************
  * USB PSY REGISTRATION *
  ************************/
+static const char *smb5_get_usb_type_name(int type)
+{
+	switch (type) {
+	case POWER_SUPPLY_TYPE_USB:
+		return "USB";
+	case POWER_SUPPLY_TYPE_USB_DCP:
+		return "USB_DCP";
+	case POWER_SUPPLY_TYPE_USB_CDP:
+		return "USB_CDP";
+	case POWER_SUPPLY_TYPE_USB_ACA:
+		return "USB_ACA";
+	case POWER_SUPPLY_TYPE_USB_TYPE_C:
+		return "USB_C";
+	case POWER_SUPPLY_TYPE_USB_PD:
+		return "USB_PD";
+	case POWER_SUPPLY_TYPE_USB_PD_DRP:
+		return "USB_PD_DRP";
+	case POWER_SUPPLY_TYPE_APPLE_BRICK_ID:
+		return "BrickID";
+	case POWER_SUPPLY_TYPE_USB_HVDCP:
+	case QTI_POWER_SUPPLY_TYPE_USB_HVDCP:
+		return "USB_HVDCP";
+	case POWER_SUPPLY_TYPE_USB_HVDCP_3:
+	case QTI_POWER_SUPPLY_TYPE_USB_HVDCP_3:
+		return "USB_HVDCP_3";
+	case POWER_SUPPLY_TYPE_USB_HVDCP_3P5:
+	case QTI_POWER_SUPPLY_TYPE_USB_HVDCP_3P5:
+		return "USB_HVDCP_3P5";
+	case POWER_SUPPLY_TYPE_USB_FLOAT:
+	case QTI_POWER_SUPPLY_TYPE_USB_FLOAT:
+		return "USB_FLOAT";
+	default:
+		return "Unknown";
+	}
+}
+
+/* Keep MIUI's QC3 sysfs ABI on the same control path as IIO consumers. */
+static int smb5_psy_iio_channel(enum power_supply_property psp)
+{
+	switch (psp) {
+	case POWER_SUPPLY_PROP_USB_PD_ACTIVE:
+		return PSY_IIO_PD_ACTIVE;
+	case POWER_SUPPLY_PROP_CHARGER_STATUS:
+		return PSY_IIO_CHARGER_STATUS;
+	case POWER_SUPPLY_PROP_SKIN_HEALTH:
+		return PSY_IIO_SKIN_HEALTH;
+	case POWER_SUPPLY_PROP_CTM_CURRENT_MAX:
+		return PSY_IIO_CTM_CURRENT_MAX;
+	case POWER_SUPPLY_PROP_APSD_RERUN:
+		return PSY_IIO_APSD_RERUN;
+	case POWER_SUPPLY_PROP_APSD_TIMEOUT:
+		return PSY_IIO_APSD_TIMEOUT;
+	case POWER_SUPPLY_PROP_HVDCP3_TYPE:
+		return PSY_IIO_HVDCP3_TYPE;
+	case POWER_SUPPLY_PROP_HVDCP_OPTI_ALLOWED:
+		return PSY_IIO_HVDCP_OPTI_ALLOWED;
+	case POWER_SUPPLY_PROP_QC_OPTI_DISABLE:
+		return PSY_IIO_QC_OPTI_DISABLE;
+	case POWER_SUPPLY_PROP_ADAPTER_CC_MODE:
+		return PSY_IIO_ADAPTER_CC_MODE;
+	case POWER_SUPPLY_PROP_VOLTAGE_VPH:
+		return PSY_IIO_VOLTAGE_VPH;
+	case POWER_SUPPLY_PROP_THERM_ICL_LIMIT:
+		return PSY_IIO_THERM_ICL_LIMIT;
+	case POWER_SUPPLY_PROP_TYPE_RECHECK:
+		return PSY_IIO_TYPE_RECHECK;
+	case POWER_SUPPLY_PROP_SMB_EN_MODE:
+		return PSY_IIO_SMB_EN_MODE;
+	case POWER_SUPPLY_PROP_SMB_EN_REASON:
+		return PSY_IIO_SMB_EN_REASON;
+	case POWER_SUPPLY_PROP_HW_CURRENT_MAX:
+		return PSY_IIO_HW_CURRENT_MAX;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX_LIMIT:
+		return PSY_IIO_VOLTAGE_MAX_LIMIT;
+	case POWER_SUPPLY_PROP_CONNECTOR_HEALTH:
+		return PSY_IIO_CONNECTOR_HEALTH;
+	case POWER_SUPPLY_PROP_INPUT_VOLTAGE_SETTLED:
+		return PSY_IIO_MAIN_INPUT_VOLTAGE_SETTLED;
+	case POWER_SUPPLY_PROP_FCC_DELTA:
+		return PSY_IIO_FCC_DELTA;
+	case POWER_SUPPLY_PROP_FLASH_ACTIVE:
+		return PSY_IIO_FLASH_ACTIVE;
+	case POWER_SUPPLY_PROP_FLASH_TRIGGER:
+		return PSY_IIO_FLASH_TRIGGER;
+	case POWER_SUPPLY_PROP_TOGGLE_STAT:
+		return PSY_IIO_TOGGLE_STAT;
+	case POWER_SUPPLY_PROP_MAIN_FCC_MAX:
+		return PSY_IIO_MAIN_FCC_MAX;
+	case POWER_SUPPLY_PROP_IRQ_STATUS:
+		return PSY_IIO_IRQ_STATUS;
+	case POWER_SUPPLY_PROP_FORCE_MAIN_FCC:
+		return PSY_IIO_FORCE_MAIN_FCC;
+	case POWER_SUPPLY_PROP_FORCE_MAIN_ICL:
+		return PSY_IIO_FORCE_MAIN_ICL;
+	case POWER_SUPPLY_PROP_COMP_CLAMP_LEVEL:
+		return PSY_IIO_COMP_CLAMP_LEVEL;
+	case POWER_SUPPLY_PROP_HOT_TEMP:
+		return PSY_IIO_HOT_TEMP;
+	case POWER_SUPPLY_PROP_CHARGER_TEMP:
+		return PSY_IIO_CHARGER_TEMP;
+	case POWER_SUPPLY_PROP_CHARGER_TEMP_MAX:
+		return PSY_IIO_CHARGER_TEMP_MAX;
+	case POWER_SUPPLY_PROP_SW_JEITA_ENABLED:
+		return PSY_IIO_SW_JEITA_ENABLED;
+	case POWER_SUPPLY_PROP_PARALLEL_DISABLE:
+		return PSY_IIO_PARALLEL_DISABLE;
+	case POWER_SUPPLY_PROP_CHARGE_DONE:
+		return PSY_IIO_CHARGE_DONE;
+	case POWER_SUPPLY_PROP_RERUN_AICL:
+		return PSY_IIO_RERUN_AICL;
+	case POWER_SUPPLY_PROP_DP_DM:
+		return PSY_IIO_DP_DM;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMITED:
+		return PSY_IIO_INPUT_CURRENT_LIMITED;
+	case POWER_SUPPLY_PROP_DIE_HEALTH:
+		return PSY_IIO_DIE_HEALTH;
+	case POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE:
+		return PSY_IIO_FCC_STEPPER_ENABLE;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED:
+		return PSY_IIO_MAIN_INPUT_CURRENT_SETTLED;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+		return PSY_IIO_VOLTAGE_MAX;
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		return PSY_IIO_CONSTANT_CHARGE_CURRENT_MAX;
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+		return PSY_IIO_CURRENT_MAX;
+	case POWER_SUPPLY_PROP_HEALTH:
+		return PSY_IIO_HEALTH;
+	default:
+		return -EINVAL;
+	}
+}
+
+static int smb5_psy_get_iio_prop(struct smb_charger *chg,
+		enum power_supply_property psp,
+		union power_supply_propval *val)
+{
+	int channel = smb5_psy_iio_channel(psp);
+	int rc;
+
+	if (channel < 0)
+		return channel;
+
+	rc = smb5_iio_get_prop(chg, channel, &val->intval);
+	return rc < 0 ? rc : 0;
+}
+
 static enum power_supply_property smb5_usb_props[] = {
 	POWER_SUPPLY_PROP_PRESENT,
 	POWER_SUPPLY_PROP_ONLINE,
@@ -1198,6 +1345,27 @@ static enum power_supply_property smb5_usb_props[] = {
 	POWER_SUPPLY_PROP_SCOPE,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_POWER_NOW,
+	POWER_SUPPLY_PROP_REAL_TYPE,
+	POWER_SUPPLY_PROP_TYPEC_MODE,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED,
+	POWER_SUPPLY_PROP_HVDCP3_TYPE,
+	POWER_SUPPLY_PROP_HVDCP_OPTI_ALLOWED,
+	POWER_SUPPLY_PROP_QC_OPTI_DISABLE,
+	POWER_SUPPLY_PROP_ADAPTER_CC_MODE,
+	POWER_SUPPLY_PROP_VOLTAGE_VPH,
+	POWER_SUPPLY_PROP_THERM_ICL_LIMIT,
+	POWER_SUPPLY_PROP_TYPE_RECHECK,
+	POWER_SUPPLY_PROP_SMB_EN_MODE,
+	POWER_SUPPLY_PROP_SMB_EN_REASON,
+	POWER_SUPPLY_PROP_HW_CURRENT_MAX,
+	POWER_SUPPLY_PROP_VOLTAGE_MAX_LIMIT,
+	POWER_SUPPLY_PROP_CONNECTOR_HEALTH,
+	POWER_SUPPLY_PROP_USB_PD_ACTIVE,
+	POWER_SUPPLY_PROP_CHARGER_STATUS,
+	POWER_SUPPLY_PROP_SKIN_HEALTH,
+	POWER_SUPPLY_PROP_CTM_CURRENT_MAX,
+	POWER_SUPPLY_PROP_APSD_RERUN,
+	POWER_SUPPLY_PROP_APSD_TIMEOUT,
 };
 
 static int smb5_usb_get_prop(struct power_supply *psy,
@@ -1261,6 +1429,36 @@ static int smb5_usb_get_prop(struct power_supply *psy,
 		else
 			rc = -ENODATA;
 		break;
+	case POWER_SUPPLY_PROP_REAL_TYPE:
+		val->strval = smb5_get_usb_type_name(chg->real_charger_type);
+		break;
+	case POWER_SUPPLY_PROP_TYPEC_MODE:
+		if (chg->connector_type == QTI_POWER_SUPPLY_CONNECTOR_MICRO_USB)
+			val->intval = QTI_POWER_SUPPLY_TYPEC_NONE;
+		else
+			val->intval = chg->typec_mode;
+		break;
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED:
+	case POWER_SUPPLY_PROP_HVDCP3_TYPE:
+	case POWER_SUPPLY_PROP_HVDCP_OPTI_ALLOWED:
+	case POWER_SUPPLY_PROP_QC_OPTI_DISABLE:
+	case POWER_SUPPLY_PROP_ADAPTER_CC_MODE:
+	case POWER_SUPPLY_PROP_VOLTAGE_VPH:
+	case POWER_SUPPLY_PROP_THERM_ICL_LIMIT:
+	case POWER_SUPPLY_PROP_TYPE_RECHECK:
+	case POWER_SUPPLY_PROP_SMB_EN_MODE:
+	case POWER_SUPPLY_PROP_SMB_EN_REASON:
+	case POWER_SUPPLY_PROP_HW_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX_LIMIT:
+	case POWER_SUPPLY_PROP_CONNECTOR_HEALTH:
+	case POWER_SUPPLY_PROP_USB_PD_ACTIVE:
+	case POWER_SUPPLY_PROP_CHARGER_STATUS:
+	case POWER_SUPPLY_PROP_SKIN_HEALTH:
+	case POWER_SUPPLY_PROP_CTM_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_APSD_RERUN:
+	case POWER_SUPPLY_PROP_APSD_TIMEOUT:
+		rc = smb5_psy_get_iio_prop(chg, psp, val);
+		break;
 	default:
 		pr_err("get prop %d is not supported in usb\n", psp);
 		rc = -EINVAL;
@@ -1290,6 +1488,15 @@ static int smb5_usb_set_prop(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_POWER_NOW:
 			chg->qc3p5_detected_mw = val->intval;
 		break;
+	case POWER_SUPPLY_PROP_ADAPTER_CC_MODE:
+	case POWER_SUPPLY_PROP_THERM_ICL_LIMIT:
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX_LIMIT:
+	case POWER_SUPPLY_PROP_CONNECTOR_HEALTH:
+	case POWER_SUPPLY_PROP_CTM_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_APSD_RERUN:
+		rc = smb5_iio_set_prop(chg, smb5_psy_iio_channel(psp),
+					val->intval);
+		break;
 	default:
 		pr_err("Set prop %d is not supported in usb psy\n",
 				psp);
@@ -1306,6 +1513,12 @@ static int smb5_usb_prop_is_writeable(struct power_supply *psy,
 	switch (psp) {
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 	case POWER_SUPPLY_PROP_POWER_NOW:
+	case POWER_SUPPLY_PROP_ADAPTER_CC_MODE:
+	case POWER_SUPPLY_PROP_THERM_ICL_LIMIT:
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX_LIMIT:
+	case POWER_SUPPLY_PROP_CONNECTOR_HEALTH:
+	case POWER_SUPPLY_PROP_CTM_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_APSD_RERUN:
 		return 1;
 	default:
 		break;
@@ -1391,7 +1604,7 @@ static int smb5_usb_port_get_prop(struct power_supply *psy,
 		rc = smblib_get_prop_input_current_settled(chg, val);
 		break;
 	default:
-		pr_err_ratelimited("Get prop %d is not supported in pc_port\n",
+		pr_debug("Get prop %d is not supported in pc_port\n",
 				psp);
 		return -EINVAL;
 	}
@@ -1443,6 +1656,128 @@ static int smb5_init_usb_port_psy(struct smb5 *chip)
 	if (IS_ERR(chg->usb_port_psy)) {
 		pr_err("Couldn't register USB pc_port power supply\n");
 		return PTR_ERR(chg->usb_port_psy);
+	}
+
+	return 0;
+}
+
+/*****************************
+ * USB MAIN PSY REGISTRATION *
+ *****************************/
+static enum power_supply_property smb5_usb_main_props[] = {
+	POWER_SUPPLY_PROP_VOLTAGE_MAX,
+	POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX,
+	POWER_SUPPLY_PROP_TYPE,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED,
+	POWER_SUPPLY_PROP_INPUT_VOLTAGE_SETTLED,
+	POWER_SUPPLY_PROP_FCC_DELTA,
+	POWER_SUPPLY_PROP_CURRENT_MAX,
+	POWER_SUPPLY_PROP_FLASH_ACTIVE,
+	POWER_SUPPLY_PROP_FLASH_TRIGGER,
+	POWER_SUPPLY_PROP_TOGGLE_STAT,
+	POWER_SUPPLY_PROP_MAIN_FCC_MAX,
+	POWER_SUPPLY_PROP_IRQ_STATUS,
+	POWER_SUPPLY_PROP_FORCE_MAIN_FCC,
+	POWER_SUPPLY_PROP_FORCE_MAIN_ICL,
+	POWER_SUPPLY_PROP_COMP_CLAMP_LEVEL,
+	POWER_SUPPLY_PROP_HEALTH,
+	POWER_SUPPLY_PROP_HOT_TEMP,
+};
+
+static int smb5_usb_main_get_prop(struct power_supply *psy,
+		enum power_supply_property psp,
+		union power_supply_propval *val)
+{
+	struct smb_charger *chg = power_supply_get_drvdata(psy);
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_TYPE:
+		val->intval = POWER_SUPPLY_TYPE_MAIN;
+		return 0;
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_SETTLED:
+	case POWER_SUPPLY_PROP_INPUT_VOLTAGE_SETTLED:
+	case POWER_SUPPLY_PROP_FCC_DELTA:
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_FLASH_ACTIVE:
+	case POWER_SUPPLY_PROP_FLASH_TRIGGER:
+	case POWER_SUPPLY_PROP_TOGGLE_STAT:
+	case POWER_SUPPLY_PROP_MAIN_FCC_MAX:
+	case POWER_SUPPLY_PROP_IRQ_STATUS:
+	case POWER_SUPPLY_PROP_FORCE_MAIN_FCC:
+	case POWER_SUPPLY_PROP_FORCE_MAIN_ICL:
+	case POWER_SUPPLY_PROP_COMP_CLAMP_LEVEL:
+	case POWER_SUPPLY_PROP_HEALTH:
+	case POWER_SUPPLY_PROP_HOT_TEMP:
+		return smb5_psy_get_iio_prop(chg, psp, val);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int smb5_usb_main_set_prop(struct power_supply *psy,
+		enum power_supply_property psp,
+		const union power_supply_propval *val)
+{
+	struct smb_charger *chg = power_supply_get_drvdata(psy);
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+	case POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_CURRENT_MAX:
+	case POWER_SUPPLY_PROP_FLASH_ACTIVE:
+	case POWER_SUPPLY_PROP_TOGGLE_STAT:
+	case POWER_SUPPLY_PROP_MAIN_FCC_MAX:
+	case POWER_SUPPLY_PROP_FORCE_MAIN_FCC:
+	case POWER_SUPPLY_PROP_FORCE_MAIN_ICL:
+	case POWER_SUPPLY_PROP_COMP_CLAMP_LEVEL:
+	case POWER_SUPPLY_PROP_HOT_TEMP:
+		return smb5_iio_set_prop(chg, smb5_psy_iio_channel(psp),
+					 val->intval);
+	default:
+		return -EINVAL;
+	}
+}
+
+static int smb5_usb_main_prop_is_writeable(struct power_supply *psy,
+		enum power_supply_property psp)
+{
+	switch (psp) {
+	case POWER_SUPPLY_PROP_TOGGLE_STAT:
+	case POWER_SUPPLY_PROP_MAIN_FCC_MAX:
+	case POWER_SUPPLY_PROP_FORCE_MAIN_FCC:
+	case POWER_SUPPLY_PROP_FORCE_MAIN_ICL:
+	case POWER_SUPPLY_PROP_COMP_CLAMP_LEVEL:
+	case POWER_SUPPLY_PROP_HOT_TEMP:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static const struct power_supply_desc usb_main_psy_desc = {
+	.name = "main",
+	.type = POWER_SUPPLY_TYPE_MAIN,
+	.properties = smb5_usb_main_props,
+	.num_properties = ARRAY_SIZE(smb5_usb_main_props),
+	.get_property = smb5_usb_main_get_prop,
+	.set_property = smb5_usb_main_set_prop,
+	.property_is_writeable = smb5_usb_main_prop_is_writeable,
+};
+
+static int smb5_init_usb_main_psy(struct smb5 *chip)
+{
+	struct smb_charger *chg = &chip->chg;
+	struct power_supply_config main_cfg = {};
+	struct power_supply *psy;
+
+	main_cfg.drv_data = chg;
+	main_cfg.of_node = chg->dev->of_node;
+	psy = devm_power_supply_register(chg->dev, &usb_main_psy_desc, &main_cfg);
+	if (IS_ERR(psy)) {
+		pr_err("Couldn't register USB main power supply\n");
+		return PTR_ERR(psy);
 	}
 
 	return 0;
@@ -1567,6 +1902,18 @@ static int smb5_init_dc_psy(struct smb5 *chip)
  * BATT PSY REGISTRATION *
  *************************/
 static enum power_supply_property smb5_batt_props[] = {
+	POWER_SUPPLY_PROP_DP_DM,
+	POWER_SUPPLY_PROP_PARALLEL_DISABLE,
+	POWER_SUPPLY_PROP_RERUN_AICL,
+	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMITED,
+	POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE,
+	POWER_SUPPLY_PROP_CHARGE_DONE,
+	POWER_SUPPLY_PROP_CHARGER_TEMP,
+	POWER_SUPPLY_PROP_CHARGER_TEMP_MAX,
+	POWER_SUPPLY_PROP_SW_JEITA_ENABLED,
+	POWER_SUPPLY_PROP_DIE_HEALTH,
+	POWER_SUPPLY_PROP_INPUT_SUSPEND,
+	POWER_SUPPLY_PROP_CHARGING_ENABLED,
 	POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT,
 	POWER_SUPPLY_PROP_STATUS,
 	POWER_SUPPLY_PROP_HEALTH,
@@ -1612,6 +1959,7 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 		rc = smblib_get_prop_batt_present(chg, pval);
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
 		rc = smblib_get_prop_input_suspend(chg, pval);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_TYPE:
@@ -1690,8 +2038,23 @@ static int smb5_batt_get_prop(struct power_supply *psy,
 		rc = smblib_get_prop_from_bms(chg,
 				SMB5_QG_TIME_TO_FULL_NOW, &pval->intval);
 		break;
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+		pval->intval = !get_effective_result(chg->chg_disable_votable);
+		break;
+	case POWER_SUPPLY_PROP_DP_DM:
+	case POWER_SUPPLY_PROP_PARALLEL_DISABLE:
+	case POWER_SUPPLY_PROP_RERUN_AICL:
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMITED:
+	case POWER_SUPPLY_PROP_FCC_STEPPER_ENABLE:
+	case POWER_SUPPLY_PROP_CHARGE_DONE:
+	case POWER_SUPPLY_PROP_CHARGER_TEMP:
+	case POWER_SUPPLY_PROP_CHARGER_TEMP_MAX:
+	case POWER_SUPPLY_PROP_SW_JEITA_ENABLED:
+	case POWER_SUPPLY_PROP_DIE_HEALTH:
+		rc = smb5_psy_get_iio_prop(chg, psp, pval);
+		break;
 	default:
-		pr_err("batt power supply prop %d not supported\n", psp);
+		pr_debug("batt power supply prop %d not supported\n", psp);
 		return -EINVAL;
 	}
 
@@ -1718,6 +2081,7 @@ static int smb5_batt_set_prop(struct power_supply *psy,
 		rc = smblib_set_prop_batt_status(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
 		rc = smblib_set_prop_input_suspend(chg, val);
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
@@ -1745,6 +2109,17 @@ static int smb5_batt_set_prop(struct power_supply *psy,
 		smb5_config_iterm(chg, val->intval, 50);
 		break;
 #endif
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+		rc = vote(chg->chg_disable_votable, USER_VOTER, !val->intval, 0);
+		break;
+	case POWER_SUPPLY_PROP_DP_DM:
+	case POWER_SUPPLY_PROP_PARALLEL_DISABLE:
+	case POWER_SUPPLY_PROP_RERUN_AICL:
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMITED:
+	case POWER_SUPPLY_PROP_DIE_HEALTH:
+		rc = smb5_iio_set_prop(chg, smb5_psy_iio_channel(prop),
+					val->intval);
+		break;
 	default:
 		rc = -EINVAL;
 	}
@@ -1759,6 +2134,13 @@ static int smb5_batt_prop_is_writeable(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_STATUS:
 	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
 	case POWER_SUPPLY_PROP_CAPACITY:
+	case POWER_SUPPLY_PROP_INPUT_SUSPEND:
+	case POWER_SUPPLY_PROP_CHARGING_ENABLED:
+	case POWER_SUPPLY_PROP_DP_DM:
+	case POWER_SUPPLY_PROP_PARALLEL_DISABLE:
+	case POWER_SUPPLY_PROP_RERUN_AICL:
+	case POWER_SUPPLY_PROP_INPUT_CURRENT_LIMITED:
+	case POWER_SUPPLY_PROP_DIE_HEALTH:
 		return 1;
 	default:
 		break;
@@ -3669,6 +4051,12 @@ static int smb5_probe(struct platform_device *pdev)
 	rc = smb5_init_usb_port_psy(chip);
 	if (rc < 0) {
 		pr_err("Couldn't initialize usb pc_port psy rc=%d\n", rc);
+		goto cleanup;
+	}
+
+	rc = smb5_init_usb_main_psy(chip);
+	if (rc < 0) {
+		pr_err("Couldn't initialize usb main psy rc=%d\n", rc);
 		goto cleanup;
 	}
 
