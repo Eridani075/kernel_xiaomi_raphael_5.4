@@ -5777,9 +5777,103 @@ static DEVICE_ATTR(fod_hbm, 0220,
 			NULL,
 			sysfs_fod_hbm_write);
 
+/*
+ * Plain (non-FOD) HBM control for LiveDisplay. Readback reports the requested
+ * state: the last accepted userspace request, not a measurement of the panel
+ * and not proof that a command was transferred.
+ */
+static ssize_t sysfs_hbm_read(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct dsi_display *display;
+
+	display = dev_get_drvdata(dev);
+	if (!display || !display->panel)
+		return -EINVAL;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n",
+			READ_ONCE(display->panel->hbm_requested) ? 1 : 0);
+}
+
+static ssize_t sysfs_hbm_write(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct dsi_display *display;
+	struct dsi_panel *panel;
+	unsigned int val;
+	bool prev_requested;
+	u32 prev_retry_count;
+	int prev_pending;
+	bool on;
+	int rc;
+
+	display = dev_get_drvdata(dev);
+	if (!display || !display->panel)
+		return -EINVAL;
+
+	panel = display->panel;
+
+	rc = kstrtouint(buf, 10, &val);
+	if (rc)
+		return rc;
+	if (val > 1)
+		return -EINVAL;
+	on = !!val;
+
+	mutex_lock(&panel->panel_lock);
+
+	/*
+	 * Only record the request first. DSI clocks are brought up solely when a
+	 * command really has to be transferred; a request made while the panel
+	 * is off, in LP1/LP2 or recovering from ESD is kept and applied on the
+	 * next post enable / LP exit instead.
+	 */
+	prev_requested = panel->hbm_requested;
+	prev_retry_count = panel->hbm_retry_count;
+	prev_pending = atomic_read(&panel->hbm_retry_pending);
+	rc = dsi_panel_hbm_request(panel, on);
+	if (rc > 0) {
+		rc = dsi_display_clk_ctrl(display->dsi_clk_handle,
+					  DSI_ALL_CLKS, DSI_CLK_ON);
+		if (rc) {
+			pr_err("hbm: failed to enable DSI clocks: %d\n", rc);
+		} else {
+			rc = dsi_panel_hbm_tx(panel);
+			dsi_display_clk_ctrl(display->dsi_clk_handle,
+					     DSI_ALL_CLKS, DSI_CLK_OFF);
+		}
+	}
+
+	if (rc) {
+		/*
+		 * Restore the whole request state, not just the flag: the accepted
+		 * request reset the retry budget and the pending restore before
+		 * any clock was touched, so a failed write must not lose them.
+		 * The last successfully submitted state is not modified and no
+		 * physical rollback is claimed: a transfer that failed midway may
+		 * already have reached the panel.
+		 */
+		panel->hbm_requested = prev_requested;
+		panel->hbm_retry_count = prev_retry_count;
+		atomic_set(&panel->hbm_retry_pending, prev_pending);
+	}
+
+	mutex_unlock(&panel->panel_lock);
+
+	if (rc)
+		return rc;
+
+	return count;
+}
+
+static DEVICE_ATTR(hbm, 0644,
+			sysfs_hbm_read,
+			sysfs_hbm_write);
+
 static struct attribute *display_fs_attrs[] = {
 	&dev_attr_fod_ui.attr,
 	&dev_attr_fod_hbm.attr,
+	&dev_attr_hbm.attr,
 	NULL,
 };
 

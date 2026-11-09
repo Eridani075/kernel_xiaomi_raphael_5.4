@@ -281,6 +281,24 @@ struct dsi_panel {
 	bool is_twm_en;
 	bool skip_panel_off;
 	bool panel_initialized;
+	/*
+	 * Plain (non-FOD) HBM: hbm_requested is the last accepted userspace
+	 * request, hbm_applied records that the corresponding command set was
+	 * successfully submitted to the panel, and lp_active tracks that the
+	 * panel entered LP1/LP2 so the unsynchronised outer power_mode field is
+	 * not needed to decide whether a command may be sent. All are protected
+	 * by panel_lock. fod_hbm_applied mirrors the FOD state last submitted; it
+	 * gates the plain HBM priority and is read lock-free by the commit path.
+	 * DRM keeps its own request history in sde_connector.c.
+	 * hbm_retry_pending is set when restoring plain HBM failed or was deferred
+	 * and is retried from the commit path and from post enable / LP exit.
+	 */
+	bool hbm_requested;
+	bool hbm_applied;
+	bool lp_active;
+	u32 hbm_retry_count;
+	atomic_t fod_hbm_applied;
+	atomic_t hbm_retry_pending;
 	bool te_using_watchdog_timer;
 	struct dsi_qsync_capabilities qsync_caps;
 
@@ -453,6 +471,16 @@ void dsi_panel_destroy_cmd_packets(struct dsi_panel_cmd_set *set);
 void dsi_panel_dealloc_cmd_packets(struct dsi_panel_cmd_set *set);
 
 int dsi_panel_set_fod_hbm(struct dsi_panel *panel, bool status);
+
+/*
+ * Plain HBM: dsi_panel_hbm_request() only records/validates the request and
+ * tells the caller whether a command has to be sent (1) or not (0); it never
+ * touches DSI clocks. dsi_panel_hbm_tx() performs the transfer and expects the
+ * caller to hold panel_lock with DSI clocks already enabled.
+ */
+int dsi_panel_hbm_request(struct dsi_panel *panel, bool on);
+int dsi_panel_hbm_tx(struct dsi_panel *panel);
+void dsi_panel_retry_hbm(struct dsi_panel *panel);
 
 u32 dsi_panel_get_fod_dim_alpha(struct dsi_panel *panel);
 

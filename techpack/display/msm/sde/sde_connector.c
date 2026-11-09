@@ -871,11 +871,21 @@ static int _sde_connector_update_dirty_properties(
 
 void sde_connector_update_fod_hbm(struct drm_connector *connector)
 {
-	static atomic_t effective_status = ATOMIC_INIT(false);
 	struct sde_crtc_state *cstate;
 	struct sde_connector *c_conn;
+	struct dsi_panel *panel;
 	struct dsi_display *display;
+	int rc;
+	bool changed;
+	bool retry;
 	bool status;
+	/*
+	 * Request history of this DRM path only. Another writer of the FOD
+	 * command (sysfs fod_hbm) must not be cancelled by an unchanged DRM
+	 * request, so this cache is deliberately independent of the panel's
+	 * applied state and of the other source.
+	 */
+	static atomic_t drm_status = ATOMIC_INIT(false);
 
 	if (!connector) {
 		SDE_ERROR("invalid connector\n");
@@ -887,6 +897,9 @@ void sde_connector_update_fod_hbm(struct drm_connector *connector)
 		return;
 
 	display = (struct dsi_display *) c_conn->display;
+	if (!display || !display->panel)
+		return;
+	panel = display->panel;
 
 	if (!c_conn->encoder || !c_conn->encoder->crtc ||
 			!c_conn->encoder->crtc->state)
@@ -894,13 +907,52 @@ void sde_connector_update_fod_hbm(struct drm_connector *connector)
 
 	cstate = to_sde_crtc_state(c_conn->encoder->crtc->state);
 	status = cstate->fod_dim_layer != NULL;
-	if (atomic_xchg(&effective_status, status) == status)
+
+	/*
+	 * Only this source's request history decides whether DRM has work to
+	 * do: an unchanged DRM request never cancels a FOD command issued by
+	 * sysfs, and vice versa. A pending plain HBM restore keeps calling in
+	 * as well, whatever the DRM FOD request is, which is how a restore is
+	 * retried without a new userspace request.
+	 */
+	changed = atomic_xchg(&drm_status, status) != status;
+	retry = !changed && atomic_read(&panel->hbm_retry_pending);
+	if (!changed && !retry)
 		return;
 
-	mutex_lock(&display->panel->panel_lock);
-	dsi_panel_set_fod_hbm(display->panel, status);
-	mutex_unlock(&display->panel->panel_lock);
-	dsi_display_set_fod_ui(display, status);
+	if (retry) {
+		/*
+		 * Degraded path: only the pending plain HBM restore is retried,
+		 * never a FOD command. This also runs while the DRM request is
+		 * still true, so a FOD on that failed after dropping plain HBM
+		 * cannot leave the panel without either highlight; the panel
+		 * side re-checks under panel_lock and does nothing while a FOD
+		 * highlight is actually applied.
+		 */
+		mutex_lock(&panel->panel_lock);
+		dsi_panel_retry_hbm(panel);
+		mutex_unlock(&panel->panel_lock);
+		return;
+	}
+
+	mutex_lock(&panel->panel_lock);
+	rc = dsi_panel_set_fod_hbm(panel, status);
+	mutex_unlock(&panel->panel_lock);
+
+	if (rc == -EAGAIN) {
+		/* Panel not ready yet: let a later commit retry this request. */
+		atomic_set(&drm_status, !status);
+		SDE_DEBUG("fod hbm %d deferred, panel not ready\n", status);
+		return;
+	}
+	if (rc) {
+		SDE_ERROR("fod hbm %d failed, rc=%d\n", status, rc);
+		return;
+	}
+
+	/* Notify only for a real DRM request change, not for a plain retry. */
+	if (changed)
+		dsi_display_set_fod_ui(display, status);
 }
 
 struct sde_connector_dyn_hdr_metadata *sde_connector_get_dyn_hdr_meta(

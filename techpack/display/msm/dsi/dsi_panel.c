@@ -740,23 +740,309 @@ u32 dsi_panel_get_fod_dim_alpha(struct dsi_panel *panel)
 			panel->fod_dim_lut[i - 1].alpha, panel->fod_dim_lut[i].alpha);
 }
 
+static bool dsi_panel_hbm_cmd_available(struct dsi_panel *panel)
+{
+	struct dsi_display_mode_priv_info *priv_info;
+
+	if (!panel->cur_mode || !panel->cur_mode->priv_info)
+		return false;
+
+	priv_info = panel->cur_mode->priv_info;
+
+	return priv_info->cmd_sets[DSI_CMD_SET_DISP_HBM_ON].count &&
+		priv_info->cmd_sets[DSI_CMD_SET_DISP_HBM_OFF].count;
+}
+
+/* The panel can take a brightness command in its current state. */
+static bool dsi_panel_hbm_sendable(struct dsi_panel *panel, bool panel_on)
+{
+	if (!panel->host || !panel->panel_initialized)
+		return false;
+	/*
+	 * lp_active is maintained under panel_lock together with the LP1/LP2
+	 * transfer itself, so it is already valid while the caller outside this
+	 * file has not yet updated panel->power_mode.
+	 */
+	if (!panel_on && panel->lp_active)
+		return false;
+	if (atomic_read(&panel->esd_recovery_pending))
+		return false;
+
+	return true;
+}
+
+#define DSI_PANEL_HBM_RETRY_MAX 3
+
+/*
+ * The FOD command keeps the original power semantics: once the panel is
+ * initialized it is sent regardless of LP1/LP2, because the highlight can be
+ * requested while the panel is in a low power state (AOD style fingerprint
+ * use). Unlike plain HBM this path adds no low power rejection; only a missing
+ * host or an uninitialized panel defers it.
+ */
+static bool dsi_panel_fod_sendable(struct dsi_panel *panel)
+{
+	return panel->host && panel->panel_initialized;
+}
+
+/*
+ * Send the plain HBM command matching the accepted request. The caller holds
+ * panel_lock and has the DSI clocks enabled. hbm_applied only records the
+ * command set that was successfully submitted; it is not a measurement of the
+ * panel, so a failed transfer leaves the last submitted state untouched and no
+ * physical rollback is claimed.
+ */
+int dsi_panel_hbm_tx(struct dsi_panel *panel)
+{
+	bool desired;
+	int rc;
+
+	if (!panel)
+		return -EINVAL;
+
+	desired = panel->hbm_requested && !atomic_read(&panel->fod_hbm_applied);
+	if (desired == panel->hbm_applied) {
+		atomic_set(&panel->hbm_retry_pending, false);
+		panel->hbm_retry_count = 0;
+		return 0;
+	}
+
+	if (!dsi_panel_hbm_cmd_available(panel)) {
+		DSI_ERR("[%s] panel DTS has no plain HBM on/off commands\n",
+			panel->name);
+		return -EOPNOTSUPP;
+	}
+
+	rc = dsi_panel_tx_cmd_set(panel, desired ? DSI_CMD_SET_DISP_HBM_ON :
+		DSI_CMD_SET_DISP_HBM_OFF);
+	if (rc) {
+		DSI_ERR("[%s] failed to send %s cmd, rc=%d\n", panel->name,
+			desired ? "DSI_CMD_SET_DISP_HBM_ON" :
+			"DSI_CMD_SET_DISP_HBM_OFF", rc);
+		return rc;
+	}
+
+	panel->hbm_applied = desired;
+	atomic_set(&panel->hbm_retry_pending, false);
+	panel->hbm_retry_count = 0;
+	return 0;
+}
+
+/*
+ * The panel loses the programmed brightness/FOD state on blank or when it
+ * enters LP1/LP2. Cached "applied" state must be dropped so that the next post
+ * enable / LP exit resends it; the userspace request is kept.
+ */
+static void dsi_panel_hbm_mark_lost(struct dsi_panel *panel)
+{
+	panel->hbm_applied = false;
+	atomic_set(&panel->fod_hbm_applied, false);
+}
+
+/*
+ * Reapply the accepted request once the panel has regained a full-on state
+ * (post enable or LP exit). States where the panel cannot take commands are
+ * left for the next opportunity.
+ */
+static int dsi_panel_hbm_reapply(struct dsi_panel *panel, bool panel_on)
+{
+	bool desired;
+
+	desired = panel->hbm_requested && !atomic_read(&panel->fod_hbm_applied);
+	if (desired == panel->hbm_applied)
+		return 0;
+
+	/*
+	 * Tell the caller the restore is deferred (screen off, LP1/LP2, ESD
+	 * recovery) instead of returning success: the caller must keep the
+	 * request pending so a later commit or lifecycle event retries it.
+	 */
+	if (!dsi_panel_hbm_sendable(panel, panel_on))
+		return -EAGAIN;
+
+	return dsi_panel_hbm_tx(panel);
+}
+
+/*
+ * Under panel_lock: true when dsi_panel_hbm_tx() would really transfer a
+ * command. Used so a deferred retry (FOD owning the panel, LP1/LP2, screen
+ * off) does not consume the bounded attempt budget.
+ */
+static bool dsi_panel_hbm_tx_wanted(struct dsi_panel *panel)
+{
+	bool desired;
+
+	if (!dsi_panel_hbm_sendable(panel, false))
+		return false;
+
+	desired = panel->hbm_requested && !atomic_read(&panel->fod_hbm_applied);
+	return desired != panel->hbm_applied;
+}
+
+/*
+ * Bounded automatic retry of a failed plain HBM restore. The budget is reset
+ * by a new userspace request and by lifecycle events (post enable, LP exit,
+ * FOD transitions) and is consumed only when a transfer is actually attempted;
+ * once exhausted the request stays pending but no further transfer is tried
+ * until one of those events, so a persistent panel failure degrades to
+ * "request kept" instead of a per-frame transfer and log flood.
+ */
+static void dsi_panel_hbm_retry_locked(struct dsi_panel *panel)
+{
+	int rc;
+
+	if (!atomic_read(&panel->hbm_retry_pending))
+		return;
+
+	if (!dsi_panel_hbm_tx_wanted(panel))
+		return;
+
+	if (panel->hbm_retry_count >= DSI_PANEL_HBM_RETRY_MAX)
+		return;
+
+	panel->hbm_retry_count++;
+	rc = dsi_panel_hbm_reapply(panel, false);
+	if (!rc)
+		return;
+
+	DSI_ERR("[%s] plain HBM retry %u/%u failed, rc=%d\n",
+		panel->name, panel->hbm_retry_count,
+		(u32)DSI_PANEL_HBM_RETRY_MAX, rc);
+	if (panel->hbm_retry_count >= DSI_PANEL_HBM_RETRY_MAX)
+		DSI_ERR("[%s] plain HBM retry budget exhausted, request kept\n",
+			panel->name);
+}
+
+/*
+ * Plain HBM retry entry for the commit path. It never issues a FOD command, so
+ * a retry can not cancel a highlight enabled through the other writer; while
+ * FOD owns the panel the restore stays deferred. Caller holds panel_lock.
+ */
+void dsi_panel_retry_hbm(struct dsi_panel *panel)
+{
+	if (!panel)
+		return;
+
+	dsi_panel_hbm_retry_locked(panel);
+}
+
+/*
+ * Record a plain HBM request. Returns 1 when the caller has to send a command
+ * with the DSI clocks enabled, 0 when the request is recorded but nothing has
+ * to be sent (already satisfied, or deferred until the panel is ready) and a
+ * negative errno when the request is rejected.
+ */
+int dsi_panel_hbm_request(struct dsi_panel *panel, bool on)
+{
+	bool desired;
+
+	if (!panel)
+		return -EINVAL;
+
+	if (on && !dsi_panel_hbm_cmd_available(panel))
+		return -EOPNOTSUPP;
+
+	panel->hbm_requested = on;
+	atomic_set(&panel->hbm_retry_pending, false);
+	panel->hbm_retry_count = 0;
+
+	if (!dsi_panel_hbm_sendable(panel, false))
+		return 0;
+
+	desired = on && !atomic_read(&panel->fod_hbm_applied);
+
+	return desired != panel->hbm_applied;
+}
+
 int dsi_panel_set_fod_hbm(struct dsi_panel *panel, bool status)
 {
+	int plain_rc;
 	int rc = 0;
 
+	if (!panel)
+		return -EINVAL;
+
+	if (atomic_read(&panel->fod_hbm_applied) == status)
+		return 0;
+
+	/*
+	 * Original FOD power semantics: only a missing host or an uninitialized
+	 * panel can defer the command; LP1/LP2 is allowed because the highlight
+	 * may be requested while the panel is in a low power state.
+	 */
+	if (!dsi_panel_fod_sendable(panel))
+		return -EAGAIN;
+
 	if (status) {
-		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_HBM_FOD_ON);
-		if (rc)
-			pr_err("[%s] failed to send DSI_CMD_SET_DISP_HBM_FOD_ON cmd, rc=%d\n",
+		/*
+		 * Plain HBM and the FOD highlight both drive the panel display
+		 * control. Drop the plain command first and keep the request so
+		 * it can be restored when FOD ends.
+		 */
+		if (panel->hbm_applied) {
+			rc = dsi_panel_tx_cmd_set(panel,
+					DSI_CMD_SET_DISP_HBM_OFF);
+			if (rc) {
+				DSI_ERR("[%s] HBM off before FOD on failed, rc=%d\n",
 					panel->name, rc);
+				return rc;
+			}
+			panel->hbm_applied = false;
+		}
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_HBM_FOD_ON);
+		if (rc) {
+			DSI_ERR("[%s] failed to send DSI_CMD_SET_DISP_HBM_FOD_ON cmd, rc=%d\n",
+					panel->name, rc);
+			/*
+			 * Plain HBM may already have been dropped for the highlight
+			 * that never arrived. Restore it through the gated path so
+			 * LP1/LP2, screen off and ESD recovery keep their semantics;
+			 * a deferred restore stays pending for a bounded retry.
+			 * FOD stays unapplied and no UI success is reported.
+			 */
+			plain_rc = dsi_panel_hbm_reapply(panel, false);
+			if (plain_rc) {
+				if (plain_rc != -EAGAIN)
+					DSI_ERR("[%s] plain HBM restore after FOD failure, rc=%d\n",
+						panel->name, plain_rc);
+				atomic_set(&panel->hbm_retry_pending, true);
+				panel->hbm_retry_count = 0;
+			}
+			return rc;
+		}
 	} else {
 		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_HBM_FOD_OFF);
 		if (rc)
-			pr_err("[%s] failed to send DSI_CMD_SET_DISP_HBM_FOD_OFF cmd, rc=%d\n",
+			DSI_ERR("[%s] failed to send DSI_CMD_SET_DISP_HBM_FOD_OFF cmd, rc=%d\n",
 					panel->name, rc);
 	}
 
-	return rc;
+	if (rc)
+		return rc;
+
+	atomic_set(&panel->fod_hbm_applied, status);
+
+	if (status) {
+		/* FOD owns the highlight: drop any scheduled plain HBM retry. */
+		atomic_set(&panel->hbm_retry_pending, false);
+		panel->hbm_retry_count = 0;
+	} else {
+		/*
+		 * FOD is over. Restore the plain HBM request; when the panel is
+		 * still in LP the send is deferred and post enable / LP exit
+		 * takes over.
+		 */
+		panel->hbm_retry_count = 0;
+		rc = dsi_panel_hbm_reapply(panel, false);
+		if (rc) {
+			if (rc != -EAGAIN)
+				DSI_ERR("[%s] plain HBM restore after FOD failed, rc=%d\n",
+					panel->name, rc);
+			atomic_set(&panel->hbm_retry_pending, true);
+		}
+	}
+
+	return 0;
 }
 
 int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
@@ -1913,6 +2199,8 @@ const char *cmd_set_prop_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-qsync-off-commands",
 	"qcom,mdss-dsi-dispparam-hbm-fod-on-command",
 	"qcom,mdss-dsi-dispparam-hbm-fod-off-command",
+	"qcom,mdss-dsi-dispparam-hbm-on-command",
+	"qcom,mdss-dsi-dispparam-hbm-off-command",
 #if defined(CONFIG_MACH_XIAOMI_SM8150)
 	"mi,mdss-dsi-esd-check-read-command",
 #endif
@@ -1947,6 +2235,8 @@ const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-qsync-off-commands-state",
 	"qcom,mdss-dsi-dispparam-hbm-fod-on-command-state",
 	"qcom,mdss-dsi-dispparam-hbm-fod-off-command-state",
+	"qcom,mdss-dsi-dispparam-hbm-on-command-state",
+	"qcom,mdss-dsi-dispparam-hbm-off-command-state",
 #if defined(CONFIG_MACH_XIAOMI_SM8150)
 	"mi,mdss-dsi-esd-check-read-command-state",
 #endif
@@ -3833,6 +4123,9 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	if (!panel)
 		return ERR_PTR(-ENOMEM);
 
+	atomic_set(&panel->fod_hbm_applied, false);
+	atomic_set(&panel->hbm_retry_pending, false);
+
 	dsi_panel_setup_vm_ops(panel, trusted_vm_env);
 
 	panel->panel_of_node = of_node;
@@ -4645,9 +4938,13 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 		dsi_pwr_panel_regulator_mode_set(&panel->power_info,
 			"ibb", REGULATOR_MODE_IDLE);
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_LP1);
-	if (rc)
+	if (rc) {
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
+	} else {
+		panel->lp_active = true;
+		dsi_panel_hbm_mark_lost(panel);
+	}
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4667,9 +4964,13 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 		goto exit;
 
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_LP2);
-	if (rc)
+	if (rc) {
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP2 cmd, rc=%d\n",
 		       panel->name, rc);
+	} else {
+		panel->lp_active = true;
+		dsi_panel_hbm_mark_lost(panel);
+	}
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4701,9 +5002,24 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 		dsi_pwr_panel_regulator_mode_set(&panel->power_info,
 			"ibb", REGULATOR_MODE_NORMAL);
 	rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_NOLP);
-	if (rc)
+	if (rc) {
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
 		       panel->name, rc);
+		goto exit;
+	}
+
+	panel->lp_active = false;
+	panel->hbm_retry_count = 0;
+
+	/* LP exit restored the full-on state: reapply pending plain HBM. */
+	rc = dsi_panel_hbm_reapply(panel, true);
+	if (rc) {
+		if (rc != -EAGAIN)
+			DSI_ERR("[%s] failed to restore plain HBM after LP exit, rc=%d\n",
+			       panel->name, rc);
+		atomic_set(&panel->hbm_retry_pending, true);
+		rc = 0;
+	}
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -5045,8 +5361,10 @@ int dsi_panel_enable(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_ON cmds, rc=%d\n",
 		       panel->name, rc);
-	else
+	else {
 		panel->panel_initialized = true;
+		panel->lp_active = false;
+	}
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
@@ -5067,6 +5385,19 @@ int dsi_panel_post_enable(struct dsi_panel *panel)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_POST_ON cmds, rc=%d\n",
 		       panel->name, rc);
 		goto error;
+	}
+
+	panel->lp_active = false;
+	panel->hbm_retry_count = 0;
+
+	/* The panel is fully on: reapply a pending plain HBM request. */
+	rc = dsi_panel_hbm_reapply(panel, true);
+	if (rc) {
+		if (rc != -EAGAIN)
+			DSI_ERR("[%s] failed to apply plain HBM, rc=%d\n",
+			       panel->name, rc);
+		atomic_set(&panel->hbm_retry_pending, true);
+		rc = 0;
 	}
 error:
 	mutex_unlock(&panel->panel_lock);
@@ -5143,6 +5474,14 @@ int dsi_panel_disable(struct dsi_panel *panel)
 	}
 	panel->panel_initialized = false;
 	panel->power_mode = SDE_MODE_DPMS_OFF;
+
+	/*
+	 * The panel no longer holds the programmed brightness state. Drop the
+	 * cached applied state; the userspace request is kept and restored on
+	 * the next post enable or LP exit.
+	 */
+	panel->lp_active = false;
+	dsi_panel_hbm_mark_lost(panel);
 
 	mutex_unlock(&panel->panel_lock);
 	return rc;
