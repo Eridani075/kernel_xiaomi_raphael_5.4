@@ -654,36 +654,75 @@ static ssize_t goodix_ts_power_reset_show(struct device *dev,
 	return ret;
 }
 
+static int goodix_set_double_tap(struct goodix_ts_core *core, bool enabled)
+{
+	int ret, old;
+
+	mutex_lock(&core->work_stat);
+	old = core->double_wakeup;
+	WRITE_ONCE(core->double_wakeup, enabled);
+	ret = goodix_sync_gesture_mode(core);
+	if (ret)
+		WRITE_ONCE(core->double_wakeup, old);
+	mutex_unlock(&core->work_stat);
+
+	return ret;
+}
+
+static ssize_t udfps_enabled_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct goodix_ts_core *core = dev_get_drvdata(dev);
+
+	return scnprintf(buf, PAGE_SIZE, "%d\n", READ_ONCE(core->udfps_enabled));
+}
+
+static ssize_t udfps_enabled_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct goodix_ts_core *core = dev_get_drvdata(dev);
+	bool enabled, old;
+	int ret;
+
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
+
+	mutex_lock(&core->work_stat);
+	old = core->udfps_enabled;
+	WRITE_ONCE(core->udfps_enabled, enabled);
+	ret = goodix_sync_gesture_mode(core);
+	if (ret)
+		WRITE_ONCE(core->udfps_enabled, old);
+	mutex_unlock(&core->work_stat);
+
+	return ret ? ret : count;
+}
+
+static DEVICE_ATTR_RW(udfps_enabled);
+
 #ifdef CONFIG_TOUCHSCREEN_COMMON
 static ssize_t double_tap_show(struct kobject *kobj,
 			       struct kobj_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", goodix_core_data->double_wakeup);
+	return scnprintf(buf, PAGE_SIZE, "%d\n",
+			 READ_ONCE(goodix_core_data->double_wakeup));
 }
 
 static ssize_t double_tap_store(struct kobject *kobj,
 				struct kobj_attribute *attr, const char *buf,
 				size_t count)
 {
-	int rc, val;
+	bool enabled;
+	int ret;
 
-	rc = kstrtoint(buf, 10, &val);
-	if (rc)
-		return -EINVAL;
+	ret = kstrtobool(buf, &enabled);
+	if (ret)
+		return ret;
 
-	goodix_core_data->double_wakeup = !!val;
-	if (goodix_core_data->fod_status == -1 ||
-	    goodix_core_data->fod_status == 100)
-		goodix_core_data->gesture_enabled =
-			goodix_core_data->double_wakeup |
-			goodix_core_data->aod_status;
-	else
-		goodix_core_data->gesture_enabled =
-			goodix_core_data->double_wakeup |
-			goodix_core_data->fod_status |
-			goodix_core_data->aod_status;
-
-	return count;
+	ret = goodix_set_double_tap(goodix_core_data, enabled);
+	return ret ? ret : count;
 }
 
 static struct tp_common_ops double_tap_ops = {
@@ -713,6 +752,7 @@ static struct attribute *sysfs_attrs[] = {
 	&dev_attr_read_cfg.attr,
 	&dev_attr_irq_info.attr,
 	&dev_attr_tp_power_reset.attr,
+	&dev_attr_udfps_enabled.attr,
 	NULL,
 };
 
@@ -1256,13 +1296,22 @@ static ssize_t gtp_fod_status_store(struct kobject *kobj,
 				    struct kobj_attribute *attr,
 				    const char *buf, size_t count)
 {
-	sscanf(buf, "%u", &goodix_core_data->fod_status);
+	struct goodix_ts_core *core = goodix_core_data;
+	int ret, value, old;
 
-	goodix_core_data->gesture_enabled = goodix_core_data->double_wakeup |
-					    goodix_core_data->fod_status;
-	goodix_check_gesture_stat(!!goodix_core_data->fod_status);
+	ret = kstrtoint(buf, 10, &value);
+	if (ret)
+		return ret;
 
-	return count;
+	mutex_lock(&core->work_stat);
+	old = core->fod_status;
+	WRITE_ONCE(core->fod_status, value);
+	ret = goodix_sync_gesture_mode(core);
+	if (ret)
+		WRITE_ONCE(core->fod_status, old);
+	mutex_unlock(&core->work_stat);
+
+	return ret ? ret : count;
 }
 
 static struct tp_common_ops fod_status_ops = {
@@ -1310,12 +1359,13 @@ static void goodix_switch_mode_work(struct work_struct *work)
 #endif
 	if (value >= INPUT_EVENT_WAKUP_MODE_OFF &&
 	    value <= INPUT_EVENT_WAKUP_MODE_ON) {
-		info->double_wakeup = value - INPUT_EVENT_WAKUP_MODE_OFF;
-		info->gesture_enabled = info->double_wakeup | info->fod_status;
-		/*goodix_gesture_enable(!!info->gesture_enabled);*/
+		int ret = goodix_set_double_tap(info, value == INPUT_EVENT_WAKUP_MODE_ON);
+
+		if (ret)
+			ts_err("Failed to update double tap: %d", ret);
 #ifdef CONFIG_GOODIX_HWINFO
 		snprintf(ch, sizeof(ch), "%s",
-			 info->gesture_enabled ? "enabled" : "disabled");
+			 READ_ONCE(info->double_wakeup) ? "enabled" : "disabled");
 #endif
 	}
 }
@@ -1641,6 +1691,34 @@ int goodix_ts_esd_init(struct goodix_ts_core *core)
 	return 0;
 }
 
+/* Caller serializes mode changes with work_stat. */
+int goodix_ts_enter_sleep(struct goodix_ts_core *core)
+{
+	struct goodix_ts_device *ts_dev = core->ts_dev;
+	int ret;
+
+	goodix_ts_irq_enable(core, false);
+	if (ts_dev->hw_ops->suspend) {
+		ret = ts_dev->hw_ops->suspend(ts_dev);
+		if (ret) {
+			ts_err("Failed to enter sleep: %d", ret);
+			goodix_ts_irq_enable(core, true);
+			return ret;
+		}
+	}
+	atomic_set(&core->suspended, 1);
+	atomic_set(&core->suspend_stat, TP_SLEEP);
+
+#ifdef CONFIG_PINCTRL
+	if (core->pinctrl) {
+		ret = pinctrl_select_state(core->pinctrl, core->pin_sta_suspend);
+		if (ret)
+			ts_err("Failed to select suspend pinstate: %d", ret);
+	}
+#endif
+	return 0;
+}
+
 /**
  * goodix_ts_suspend - Touchscreen suspend function
  * Called by PM/FB/EARLYSUSPEN module to put the device to  sleep
@@ -1648,7 +1726,6 @@ int goodix_ts_esd_init(struct goodix_ts_core *core)
 int goodix_ts_suspend(struct goodix_ts_core *core_data)
 {
 	struct goodix_ext_module *ext_module;
-	struct goodix_ts_device *ts_dev = core_data->ts_dev;
 	int r = 0;
 
 	ts_info("Suspend start");
@@ -1675,48 +1752,19 @@ int goodix_ts_suspend(struct goodix_ts_core *core_data)
 			r = ext_module->funcs->before_suspend(core_data,
 							      ext_module);
 			if (r == EVT_CANCEL_SUSPEND) {
-				if (core_data->double_wakeup &&
-				    core_data->fod_status) {
-					atomic_set(&core_data->suspend_stat,
-						   TP_GESTURE_DBCLK_FOD);
-				} else if (core_data->double_wakeup) {
-					atomic_set(&core_data->suspend_stat,
-						   TP_GESTURE_DBCLK);
-				} else if (core_data->fod_status) {
-					atomic_set(&core_data->suspend_stat,
-						   TP_GESTURE_FOD);
-				}
 				mutex_unlock(&goodix_modules.mutex);
-				ts_info("suspend_stat[%d]",
+				ts_info("Suspend handled by %s, state=%d",
+					ext_module->name,
 					atomic_read(&core_data->suspend_stat));
-				ts_info("Canceled by module:%s",
-					ext_module->name);
-				if (!atomic_read(&core_data->suspend_stat))
-					ts_info("go suspend remaind work\n");
-				else
-					goto out;
+				goto out;
 			}
 		}
 	}
 	mutex_unlock(&goodix_modules.mutex);
 
-	/* disable irq */
-	goodix_ts_irq_enable(core_data, false);
-
-	/* let touch ic work in sleep mode */
-	if (ts_dev && ts_dev->hw_ops->suspend)
-		ts_dev->hw_ops->suspend(ts_dev);
-	atomic_set(&core_data->suspended, 1);
-	atomic_set(&core_data->suspend_stat, TP_SLEEP);
-
-#ifdef CONFIG_PINCTRL
-	if (core_data->pinctrl) {
-		r = pinctrl_select_state(core_data->pinctrl,
-					 core_data->pin_sta_suspend);
-		if (r < 0)
-			ts_err("Failed to select active pinstate, r:%d", r);
-	}
-#endif
+	r = goodix_ts_enter_sleep(core_data);
+	if (r)
+		goto out;
 
 	/* inform exteranl modules */
 	mutex_lock(&goodix_modules.mutex);
@@ -1857,12 +1905,9 @@ static int goodix_bl_state_chg_callback(struct notifier_block *nb,
 	if (data && core_data) {
 		blank = *(int *)(data);
 		ts_info("%s val:%lu, blank:%u\n", __func__, val, blank);
-		if (blank == BACKLIGHT_OFF &&
-		    (atomic_read(&core_data->suspend_stat) &&
-		     core_data->fod_status)) {
-			ts_info("%s BACKLIGHT OFF, disable irq\n", __func__);
-			goodix_ts_irq_enable(core_data, false);
-		} else
+		/* The backlight can be off while a wake gesture still needs IRQs. */
+		if (blank != BACKLIGHT_OFF &&
+		    atomic_read(&core_data->suspend_stat) == TP_NO_SUSPEND)
 			goodix_ts_irq_enable(core_data, true);
 	}
 	return NOTIFY_OK;
@@ -1934,9 +1979,12 @@ static void goodix_ts_suspend_work(struct work_struct *work)
 static int goodix_ts_pm_suspend(struct device *dev)
 {
 	struct goodix_ts_core *core_data = dev_get_drvdata(dev);
-	if (device_may_wakeup(dev) && core_data->gesture_enabled) {
-		enable_irq_wake(core_data->irq);
-	}
+	int mode = atomic_read(&core_data->suspend_stat);
+
+	if (device_may_wakeup(dev) && mode != TP_SLEEP &&
+	    goodix_gesture_mode(core_data) != TP_SLEEP &&
+	    atomic_read(&core_data->irq_enabled))
+		core_data->irq_wake_enabled = !enable_irq_wake(core_data->irq);
 
 	core_data->tp_already_suspend = true;
 	reinit_completion(&core_data->pm_resume_completion);
@@ -1950,8 +1998,9 @@ static int goodix_ts_pm_suspend(struct device *dev)
 static int goodix_ts_pm_resume(struct device *dev)
 {
 	struct goodix_ts_core *core_data = dev_get_drvdata(dev);
-	if (device_may_wakeup(dev) && core_data->gesture_enabled) {
+	if (core_data->irq_wake_enabled) {
 		disable_irq_wake(core_data->irq);
+		core_data->irq_wake_enabled = false;
 	}
 
 	core_data->tp_already_suspend = false;

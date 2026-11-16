@@ -31,6 +31,8 @@
 #endif
 #include <linux/input/mt.h>
 #include <asm/atomic.h>
+#include <linux/pinctrl/consumer.h>
+
 #include "goodix_ts_core.h"
 
 #define GSX_REG_GESTURE_DATA 0x4100
@@ -44,12 +46,13 @@ extern int goodix_i2c_write(struct goodix_ts_device *dev, unsigned int reg,
 			    unsigned char *data, unsigned int len);
 extern int goodix_i2c_read(struct goodix_ts_device *dev, unsigned int reg,
 			   unsigned char *data, unsigned int len);
-static int goodix_set_suspend_func(struct goodix_ts_core *core_data);
-static int goodix_wakeup_and_set_suspend_func(struct goodix_ts_core *core_data);
+static int goodix_set_suspend_func(struct goodix_ts_core *core,
+				   enum tp_suspend_stat mode);
+static int goodix_wakeup_and_set_suspend_func(struct goodix_ts_core *core,
+					       enum tp_suspend_stat mode);
 
 #define GSX_KEY_DATA_LEN 37
 #define GSX_GESTURE_TYPE_LEN 32
-static int FP_Event_Gesture;
 
 /*
  * struct gesture_module - gesture module data
@@ -227,42 +230,50 @@ int goodix_gesture_enable(bool enable)
 	return 0;
 }
 
-int goodix_sync_ic_stat(struct goodix_ts_core *core_data)
+/* work_stat is held by the caller. Refresh a mode already programmed in Doze. */
+int goodix_sync_gesture_mode(struct goodix_ts_core *core)
 {
-	int tp_stat;
-	int ret = 0;
+	enum tp_suspend_stat old_mode = atomic_read(&core->suspend_stat);
+	enum tp_suspend_stat mode = goodix_gesture_mode(core);
+	int ret;
 
-	if (!core_data) {
-		ts_err("parameter illegal");
+	if (old_mode == TP_NO_SUSPEND || old_mode == mode)
+		return 0;
+	if (old_mode == TP_SLEEP)
+		return goodix_wakeup_and_set_suspend_func(core, mode);
+	if (mode == TP_SLEEP) {
+		ret = goodix_ts_enter_sleep(core);
+		if (ret)
+			return ret;
 	}
 
-	mutex_lock(&core_data->work_stat);
-	tp_stat = atomic_read(&core_data->suspend_stat);
-	if (tp_stat == TP_GESTURE_DBCLK) {
-		ts_info("sync IC suspend stat from DBCLK to DBCLK_FOD");
-
-		/*TODO:maybe add retry here*/
-		ret = goodix_set_suspend_func(core_data);
-		if (ret < 0)
-			ts_err("set suspend function failed!!");
-	} else if (tp_stat == TP_SLEEP) {
-		ts_info("sync IC suspend stat from SLEEP to FOD");
-
-		ret = goodix_wakeup_and_set_suspend_func(core_data);
-		if (ret < 0)
-			ts_err("set suspend function failed!!");
+	mutex_lock(&core->ts_dev->report_mutex);
+	if (mode != TP_SLEEP) {
+		ret = goodix_set_suspend_func(core, mode);
+		if (ret)
+			goto unlock;
+		atomic_set(&core->suspend_stat, mode);
 	}
-	mutex_unlock(&core_data->work_stat);
+	if (mode != TP_GESTURE_FOD && mode != TP_GESTURE_DBCLK_FOD &&
+	    core->fod_pressed) {
+		input_mt_slot(core->input_dev, 0);
+		input_mt_report_slot_state(core->input_dev, MT_TOOL_FINGER, false);
+		input_report_key(core->input_dev, BTN_INFO, 0);
+		input_report_key(core->input_dev, BTN_TOUCH, 0);
+		input_report_key(core->input_dev, BTN_TOOL_FINGER, 0);
+		input_sync(core->input_dev);
+		__clear_bit(0, &core->touch_id);
+		core->fod_pressed = false;
+#ifdef CONFIG_TOUCHSCREEN_COMMON
+		core->fp_pressed = 0;
+		sysfs_notify(touchpanel_kobj, NULL, "fp_state");
+#endif
+	}
+	ret = 0;
+unlock:
+	mutex_unlock(&core->ts_dev->report_mutex);
 
 	return ret;
-}
-
-int goodix_check_gesture_stat(bool enable)
-{
-	if (enable) {
-		goodix_sync_ic_stat(goodix_core_data);
-	}
-	return 0;
 }
 /**
  * gsx_gesture_data_show - show gesture data read frome IC
@@ -397,6 +408,8 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 {
 	int ret;
 	int x, y, area, overlapping_area;
+	bool fp_event;
+	enum tp_suspend_stat mode;
 	unsigned char clear_reg = 0;
 	unsigned char checksum = 0, temp_data[GSX_KEY_DATA_LEN];
 	struct goodix_ts_device *ts_dev = core_data->ts_dev;
@@ -413,6 +426,11 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 		return EVT_CONTINUE;
 
 	mutex_lock(&ts_dev->report_mutex);
+	mode = atomic_read(&core_data->suspend_stat);
+	if (mode == TP_SLEEP) {
+		mutex_unlock(&ts_dev->report_mutex);
+		return EVT_CANCEL_IRQEVT;
+	}
 	/* get ic gesture state*/
 	ret = ts_dev->hw_ops->read_trans(core_data->ts_dev,
 					 GSX_REG_GESTURE_DATA, temp_data,
@@ -424,11 +442,6 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 		goto re_send_ges_cmd;
 	}
 
-	if ((temp_data[0] & 0x08) != 0) {
-		FP_Event_Gesture = 1;
-		/*ts_debug("FP_Event_Gesture = %d", FP_Event_Gesture);*/
-	}
-
 	checksum = checksum_u8(temp_data, sizeof(temp_data));
 	if (checksum != 0) {
 		ts_err("Gesture data checksum error:0x%x", checksum);
@@ -436,13 +449,9 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 		goto re_send_ges_cmd;
 	}
 
-	/*ts_debug("temp_data： %*ph", (int)sizeof(temp_data), temp_data);
-	ts_debug("FP_Event_Gesture： %d", FP_Event_Gesture);
-	ts_debug("fod_status= %d aod_status=%d", core_data->fod_status, core_data->aod_status);
-	ts_debug("sleep_finger： %d", !core_data->sleep_finger);*/
-
-	if (core_data->fod_status || core_data->aod_status) {
-		if ((FP_Event_Gesture == 1) && (temp_data[2] == 0x46)) {
+	fp_event = temp_data[0] & 0x08;
+	if (fp_event && (mode == TP_GESTURE_FOD || mode == TP_GESTURE_DBCLK_FOD)) {
+		if (temp_data[2] == 0x46) {
 			x = temp_data[4] | (temp_data[5] << 8);
 			y = temp_data[6] | (temp_data[7] << 8);
 			overlapping_area = temp_data[8];
@@ -487,14 +496,10 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 				"Gesture report, x=%d, y=%d, overlapping_area=%d, area=%d",
 				x, y, overlapping_area, area);
 
-			/*wait for report key event*/
-			FP_Event_Gesture = 0;
 			input_sync(core_data->input_dev);
 		}
 
-		if ((FP_Event_Gesture == 1) && (temp_data[2] == 0x4c)) {
-			/*wait for report key event*/
-			FP_Event_Gesture = 0;
+		if (temp_data[2] == 0x4c) {
 			input_report_key(core_data->input_dev, KEY_GOTO, 1);
 			input_sync(core_data->input_dev);
 			input_report_key(core_data->input_dev, KEY_GOTO, 0);
@@ -503,7 +508,7 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 			ts_debug("Gesture report L");
 		}
 
-		if ((FP_Event_Gesture == 1) && (temp_data[2] == 0xff)) {
+		if (temp_data[2] == 0xff) {
 			if (core_data->fod_pressed) {
 				ts_debug("Gesture report up");
 				input_mt_slot(core_data->input_dev, 0);
@@ -535,7 +540,8 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 		write_unlock(&gsx_gesture->rwlock);
 	}
 
-	if (temp_data[2] == 0xcc && core_data->double_wakeup) {
+	if (temp_data[2] == 0xcc &&
+	    (mode == TP_GESTURE_DBCLK || mode == TP_GESTURE_DBCLK_FOD)) {
 		/*ts_info("Gesture match success, resume IC");*/
 #ifdef CONFIG_GOODIX_HWINFO
 		if (core_data) {
@@ -562,7 +568,7 @@ static int gsx_gesture_ist(struct goodix_ts_core *core_data,
 re_send_ges_cmd:
 	/*if (ts_dev->hw_ops->send_cmd(core_data->ts_dev, gesture_cmd))
 		ts_info("warning: failed re_send gesture cmd\n");*/
-	if (goodix_set_suspend_func(core_data) < 0)
+	if (goodix_set_suspend_func(core_data, mode) < 0)
 		ts_err("set suspend function failed!!");
 gesture_ist_exit:
 	ts_dev->hw_ops->write_trans(core_data->ts_dev, GSX_REG_GESTURE_DATA,
@@ -578,101 +584,71 @@ gesture_ist_exit:
  * @core_data: pointer to touch core data
  * return: 0 send cmd successful, other send cmd failed.
  */
-static int goodix_set_suspend_func(struct goodix_ts_core *core_data)
+static int goodix_set_suspend_func(struct goodix_ts_core *core,
+				   enum tp_suspend_stat mode)
 {
-	struct goodix_ts_device *dev = core_data->ts_dev;
-	u8 state_data[3] = { 0 };
-	int ret;
+	u8 state_data[] = { GSX_GESTURE_CMD, 0, 0 };
 
-	if (core_data->double_wakeup && core_data->fod_status) {
-		state_data[0] = GSX_GESTURE_CMD;
+	switch (mode) {
+	case TP_GESTURE_DBCLK_FOD:
 		state_data[1] = 0x01;
-		state_data[2] = 0xF7;
-		ret = goodix_i2c_write(dev, GSX_REG_GESTURE, state_data, 3);
-		ts_info("Set IC double wakeup mode on,FOD mode on;");
-	} else if (core_data->double_wakeup && (!core_data->fod_status)) {
-		state_data[0] = GSX_GESTURE_CMD;
+		break;
+	case TP_GESTURE_DBCLK:
 		state_data[1] = 0x03;
-		state_data[2] = 0xF5;
-		ret = goodix_i2c_write(dev, GSX_REG_GESTURE, state_data, 3);
-		ts_info("Set IC double wakeup mode on,FOD mode off;");
-	} else if (!core_data->double_wakeup && core_data->fod_status) {
-		state_data[0] = GSX_GESTURE_CMD;
-		state_data[1] = 0x00;
-		state_data[2] = 0xF8;
-		ret = goodix_i2c_write(dev, GSX_REG_GESTURE, state_data, 3);
-		ts_info("Set IC double wakeup mode off,FOD mode on;");
-	} else if (!core_data->double_wakeup && (!core_data->fod_status)) {
-		state_data[0] = GSX_GESTURE_CMD;
-		state_data[1] = 0x02;
-		state_data[2] = 0xF6;
-		ret = goodix_i2c_write(dev, GSX_REG_GESTURE, state_data, 3);
-		ts_info("Set IC double wakeup mode off,FOD mode off;");
-	} else {
-		ret = -1;
-		ts_info("Get IC mode falied,core_data->double_wakeup=%d,core_data->fod_status=%d;",
-			core_data->double_wakeup, core_data->fod_status);
+		break;
+	case TP_GESTURE_FOD:
+		break;
+	default:
+		return -EINVAL;
 	}
+	state_data[2] = 0 - state_data[0] - state_data[1];
 
-	return ret;
+	return goodix_i2c_write(core->ts_dev, GSX_REG_GESTURE,
+				state_data, sizeof(state_data));
 }
 
-/**
- *goodix_wakeup_and_set_suspend_func --- wake up ic from sleep mode and set suspend func
- *invoke this func when ic in sleep mode
- *
- * @core_data: pointer to touch core data
- * return: 0 reset ic stat successful, other failed.
- */
-static int goodix_wakeup_and_set_suspend_func(struct goodix_ts_core *core_data)
+/* Move from display-off chip sleep to gesture scanning. work_stat is held. */
+static int goodix_wakeup_and_set_suspend_func(struct goodix_ts_core *core,
+					       enum tp_suspend_stat mode)
 {
-	int r = 0;
-	int retry = 0;
 	struct goodix_ext_module *ext_module;
-	struct goodix_ts_device *ts_dev = core_data->ts_dev;
+	struct goodix_ts_device *ts_dev = core->ts_dev;
+	int ret, retry;
 
-	/*start resume*/
-	if (!list_empty(&goodix_modules.head)) {
-		list_for_each_entry(ext_module, &goodix_modules.head, list) {
-			if (!ext_module->funcs->before_resume)
-				continue;
-
-			do {
-				r = ext_module->funcs->before_resume(
-					core_data, ext_module);
-				if (r == EVT_CANCEL_RESUME) {
-					ts_info("wait for fwupdate findish");
-					mdelay(5);
-				}
-			} while (r == EVT_CANCEL_RESUME && ++retry < 3);
+	mutex_lock(&goodix_modules.mutex);
+	list_for_each_entry(ext_module, &goodix_modules.head, list) {
+		if (ext_module->funcs->before_resume &&
+		    ext_module->funcs->before_resume(core, ext_module) ==
+		    EVT_CANCEL_RESUME) {
+			mutex_unlock(&goodix_modules.mutex);
+			return -EBUSY;
 		}
 	}
+	mutex_unlock(&goodix_modules.mutex);
 
-	if (ts_dev && ts_dev->hw_ops->resume)
-		ts_dev->hw_ops->resume(ts_dev);
-	goodix_ts_irq_enable(core_data, true);
-	/*finish resume*/
-
-	/*start suspend*/
-	do {
-		r = goodix_set_suspend_func(core_data);
-		if (r < 0) {
-			ts_info("Send doze command failed, retry");
-		}
-	} while (r < 0 && ++retry < 3);
-
-	if (core_data->double_wakeup && core_data->fod_status) {
-		atomic_set(&core_data->suspend_stat, TP_GESTURE_DBCLK_FOD);
-	} else if (core_data->double_wakeup) {
-		atomic_set(&core_data->suspend_stat, TP_GESTURE_DBCLK);
-	} else if (core_data->fod_status) {
-		atomic_set(&core_data->suspend_stat, TP_GESTURE_FOD);
+#ifdef CONFIG_PINCTRL
+	if (core->pinctrl) {
+		ret = pinctrl_select_state(core->pinctrl, core->pin_sta_active);
+		if (ret)
+			return ret;
 	}
-	ts_info("suspend_stat[%d]", atomic_read(&core_data->suspend_stat));
-
-	/*finish suspend*/
-
-	return r;
+#endif
+	if (ts_dev->hw_ops->resume) {
+		ret = ts_dev->hw_ops->resume(ts_dev);
+		if (ret)
+			goto restore_sleep;
+	}
+	for (retry = 0; retry < 3; retry++) {
+		ret = goodix_set_suspend_func(core, mode);
+		if (!ret) {
+			atomic_set(&core->suspend_stat, mode);
+			goodix_ts_irq_enable(core, true);
+			return 0;
+		}
+	}
+restore_sleep:
+	goodix_ts_enter_sleep(core);
+	return ret;
 }
 
 /**
@@ -687,6 +663,7 @@ static int gsx_gesture_before_suspend(struct goodix_ts_core *core_data,
 				      struct goodix_ext_module *module)
 {
 	int ret;
+	enum tp_suspend_stat mode = goodix_gesture_mode(core_data);
 	const struct goodix_ts_hw_ops *hw_ops = core_data->ts_dev->hw_ops;
 	struct goodix_ts_cmd *gesture_cmd = &gsx_gesture->cmd;
 
@@ -695,18 +672,16 @@ static int gsx_gesture_before_suspend(struct goodix_ts_core *core_data,
 		return 0;
 	}
 
-	if (!core_data->gesture_enabled) {
-		ts_err("enter %s\n", __func__);
-		atomic_set(&core_data->suspended, 1);
+	if (mode == TP_SLEEP)
 		return EVT_CONTINUE;
-	}
 
-	ret = goodix_set_suspend_func(core_data);
+	ret = goodix_set_suspend_func(core_data, mode);
 	if (ret != 0) {
 		ts_err("Send doze command error");
 		return 0;
 	} else {
-		ts_info("Set IC in doze mode");
+		ts_info("Set IC in gesture mode %d", mode);
+		atomic_set(&core_data->suspend_stat, mode);
 		atomic_set(&core_data->suspended, 1);
 		return EVT_CANCEL_SUSPEND;
 	}

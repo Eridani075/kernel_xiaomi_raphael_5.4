@@ -468,7 +468,8 @@ struct goodix_ts_core {
 	struct work_struct power_supply_work;
 	atomic_t suspend_stat;
 	int is_usb_exist;
-	int gesture_enabled;
+	bool udfps_enabled;
+	bool irq_wake_enabled;
 	int fod_status;
 	int aod_status;
 	int fod_pressed;
@@ -494,6 +495,24 @@ struct goodix_ts_core {
 	int dbclick_count;
 #endif
 };
+
+static inline bool goodix_fod_gesture_enabled(struct goodix_ts_core *core)
+{
+	int fod_status = READ_ONCE(core->fod_status);
+
+	return READ_ONCE(core->udfps_enabled) || READ_ONCE(core->aod_status) ||
+	       (fod_status && fod_status != -1 && fod_status != 100);
+}
+
+static inline enum tp_suspend_stat
+goodix_gesture_mode(struct goodix_ts_core *core)
+{
+	bool fod = goodix_fod_gesture_enabled(core);
+
+	if (READ_ONCE(core->double_wakeup))
+		return fod ? TP_GESTURE_DBCLK_FOD : TP_GESTURE_DBCLK;
+	return fod ? TP_GESTURE_FOD : TP_SLEEP;
+}
 
 struct goodix_mode_switch {
 	struct goodix_ts_core *info;
@@ -776,7 +795,15 @@ int goodix_ts_fb_notifier_callback(struct notifier_block *self,
 extern void goodix_msg_printf(const char *fmt, ...);
 int goodix_gesture_enable(bool enable);
 
-int goodix_check_gesture_stat(bool enable);
+int goodix_ts_enter_sleep(struct goodix_ts_core *core);
+#if IS_ENABLED(CONFIG_TOUCHSCREEN_GOODIX_GTX8_GESTURE)
+int goodix_sync_gesture_mode(struct goodix_ts_core *core);
+#else
+static inline int goodix_sync_gesture_mode(struct goodix_ts_core *core)
+{
+	return 0;
+}
+#endif
 
 int goodix_get_lockdowninfo(struct goodix_ts_core *ts_core);
 extern int sync_read_rawdata(unsigned int reg, unsigned char *data,
